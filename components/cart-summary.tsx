@@ -6,19 +6,17 @@ import { useCart } from "@/lib/cart-context"
 import { Minus, Plus, Trash2 } from "lucide-react"
 import { useState } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 
 export default function CartSummary() {
   const { items, updateQuantity, removeItem, total, clearCart } = useCart()
   const [orderPlaced, setOrderPlaced] = useState(false)
+  const router = useRouter()
 
   const handlePlaceOrder = () => {
     if (items.length > 0) {
-      alert(`Order placed successfully! Total: $${total.toFixed(2)}`)
-      setOrderPlaced(true)
       clearCart()
-      setTimeout(() => {
-        setOrderPlaced(false)
-      }, 2000)
+      router.push("/order")
     }
   }
 
