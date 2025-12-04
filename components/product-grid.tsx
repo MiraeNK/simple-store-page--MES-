@@ -5,23 +5,32 @@ import { Card } from "@/components/ui/card"
 import { useCart } from "@/lib/cart-context"
 import { ShoppingCart } from "lucide-react"
 
+// HANYA 4 PRODUK UNTUK SIMPLIFIKASI
 const PRODUCTS = [
-  { id: "1", name: "Premium Wireless Headphones", price: 129.99, image: "/wireless-headphones.png" },
-  { id: "2", name: "Smart Watch Pro", price: 299.99, image: "/modern-smartwatch.png" },
-  { id: "3", name: "USB-C Cable 3-Pack", price: 19.99, image: "/usb-cables.jpg" },
-  { id: "4", name: "Wireless Charger Pad", price: 49.99, image: "/wireless-charger.png" },
-  { id: "5", name: "Phone Stand Adjustable", price: 24.99, image: "/phone-stand.jpg" },
-  { id: "6", name: "Portable Power Bank 20000mAh", price: 39.99, image: "/portable-power-bank.png" },
-  { id: "7", name: "Screen Protector 2-Pack", price: 12.99, image: "/screen-protector.png" },
-  { id: "8", name: "Phone Case Premium", price: 29.99, image: "/colorful-phone-case-display.png" },
-  { id: "9", name: "Bluetooth Speaker", price: 79.99, image: "/bluetooth-speaker.jpg" },
-  { id: "10", name: "Desk Lamp LED", price: 44.99, image: "/modern-desk-lamp.png" },
-  { id: "11", name: "Keyboard Mechanical RGB", price: 149.99, image: "/mechanical-keyboard.png" },
-  { id: "12", name: "Mouse Wireless Ergonomic", price: 59.99, image: "/ergonomic-mouse.png" },
-  { id: "13", name: "USB Hub 7-Port", price: 34.99, image: "/usb-hub.png" },
-  { id: "14", name: "Screen Stand Monitor Raiser", price: 39.99, image: "/monitor-stand.jpg" },
-  { id: "15", name: "Webcam 1080p HD", price: 69.99, image: "/classic-webcam.png" },
-  { id: "16", name: "Microphone Condenser Studio", price: 199.99, image: "/studio-microphone.jpg" },
+  { 
+    id: "1", 
+    name: "Premium Wireless Headphones", 
+    price: 129.99, 
+    image: "/wireless-headphones.png" 
+  },
+  { 
+    id: "2", 
+    name: "Smart Watch Pro", 
+    price: 299.99, 
+    image: "/modern-smartwatch.png" 
+  },
+  { 
+    id: "3", 
+    name: "Wireless Charger Pad", 
+    price: 49.99, 
+    image: "/wireless-charger.png" 
+  },
+  { 
+    id: "4", 
+    name: "Bluetooth Speaker", 
+    price: 79.99, 
+    image: "/bluetooth-speaker.jpg" 
+  },
 ]
 
 export default function ProductGrid() {

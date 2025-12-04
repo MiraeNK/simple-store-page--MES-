@@ -3,20 +3,73 @@
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { useCart } from "@/lib/cart-context"
-import { Minus, Plus, Trash2 } from "lucide-react"
+import { Minus, Plus, Trash2, Loader2 } from "lucide-react" // Tambah Loader2
 import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
+// Import Firebase functions
+import { ref, get, child, set } from "firebase/database"
+import { database } from "@/lib/firebase"
 
 export default function CartSummary() {
   const { items, updateQuantity, removeItem, total, clearCart } = useCart()
   const [orderPlaced, setOrderPlaced] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false) // State loading
   const router = useRouter()
 
-  const handlePlaceOrder = () => {
-    if (items.length > 0) {
-      clearCart()
-      router.push("/order")
+  const handlePlaceOrder = async () => {
+    if (items.length === 0) return;
+
+    setIsSubmitting(true);
+
+    try {
+      const dbRef = ref(database);
+      const ordersRef = child(dbRef, "orders");
+
+      // 1. Ambil snapshot data 'orders' untuk menghitung jumlah order saat ini
+      const snapshot = await get(ordersRef);
+      
+      let nextOrderIndex = 1;
+      if (snapshot.exists()) {
+        // Hitung jumlah key yang ada di dalam orders, lalu tambah 1
+        nextOrderIndex = Object.keys(snapshot.val()).length + 1;
+      }
+
+      const newOrderId = `order_${nextOrderIndex}`;
+
+      // 2. Siapkan data yang akan disimpan (Hanya ID dan Quantity sesuai request, atau detail lengkap)
+      // Disini saya simpan ID dan Qty agar datanya berguna
+      const orderData = items.map((item) => ({
+        id: item.id,
+        name: item.name, // Opsional: Hapus jika hanya ingin ID murni
+        quantity: item.quantity,
+        price: item.price
+      }));
+
+      // Tambahkan timestamp agar tau kapan order dibuat
+      const finalPayload = {
+        items: orderData,
+        totalAmount: total,
+        createdAt: new Date().toISOString()
+      };
+
+      // 3. Simpan ke Firebase: orders/order_n
+      await set(child(ordersRef, newOrderId), finalPayload);
+
+      // 4. Sukses
+      setOrderPlaced(true);
+      clearCart();
+      
+      // Delay sebentar agar user melihat pesan sukses sebelum redirect
+      setTimeout(() => {
+        router.push("/order");
+      }, 1500);
+
+    } catch (error) {
+      console.error("Error placing order to Firebase:", error);
+      alert("Failed to place order. Check console.");
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
@@ -24,7 +77,7 @@ export default function CartSummary() {
     <div className="lg:col-span-3">
       {orderPlaced && (
         <div className="mb-4 p-4 bg-green-50 border border-green-200 rounded-lg text-green-800">
-          ✓ Order placed successfully!
+          ✓ Order placed successfully! Saving to database...
         </div>
       )}
 
@@ -81,8 +134,20 @@ export default function CartSummary() {
             <span>${total.toFixed(2)}</span>
           </div>
         </div>
-        <Button onClick={handlePlaceOrder} disabled={items.length === 0} className="w-full" size="lg">
-          Place Order
+        <Button 
+          onClick={handlePlaceOrder} 
+          disabled={items.length === 0 || isSubmitting} 
+          className="w-full" 
+          size="lg"
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Processing...
+            </>
+          ) : (
+            "Place Order"
+          )}
         </Button>
         <Link href="/" className="block mt-3">
           <Button variant="outline" className="w-full bg-transparent">
