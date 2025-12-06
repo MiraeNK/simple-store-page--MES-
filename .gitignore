@@ -19,7 +19,11 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# Local Env Files (PENTING untuk keamanan, jangan upload API Key)
+# Firebase (Tambahan agar cache/log firebase tidak ikut ter-upload)
+.firebase/
+firebase-debug.log
+
+# Local Env Files (SANGAT PENTING: Kunci keamanan Anda)
 .env
 .env.local
 .env.development.local
