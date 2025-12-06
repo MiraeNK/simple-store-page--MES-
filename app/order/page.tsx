@@ -5,7 +5,7 @@ import Link from "next/link"
 import { ChevronLeft, CheckCircle2, Box, Truck, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { database } from "@/lib/firebase"
-import { ref, onValue, get, child } from "firebase/database"
+import { ref, onValue, update, child } from "firebase/database" // Import update
 
 type OrderStep = "idle" | "selecting" | "packaging" | "sending" | "completed"
 type DBStatus = "Todo" | "In Progress" | "Done"
@@ -13,13 +13,15 @@ type DBStatus = "Todo" | "In Progress" | "Done"
 interface OrderData {
   id: string
   items: any[]
-  // properti lain jika ada
+  status?: string // Tambahan status
+  // properti lain
 }
 
 export default function OrderPage() {
   // --- STATE ---
   const [orders, setOrders] = useState<OrderData[]>([])
-  const [activeOrderIndex, setActiveOrderIndex] = useState(0)
+  // Kita selalu memproses order pertama di antrian (FIFO)
+  const activeOrder = useMemo(() => orders[0], [orders])
   
   // Tracking Status (Global dari node 'tracking')
   const [pickingStatus, setPickingStatus] = useState<DBStatus>("Todo")
@@ -33,63 +35,63 @@ export default function OrderPage() {
   const progressInterval = useRef<NodeJS.Timeout | null>(null)
   const startTimeRef = useRef<number | null>(null)
 
-  // Computed: Order yang sedang aktif diproses
-  const activeOrder = useMemo(() => orders[activeOrderIndex], [orders, activeOrderIndex])
-
-  // 1. FETCH SEMUA ORDER (SEKALI SAJA DI AWAL)
+  // 1. FETCH & FILTER ORDER (REALTIME)
   useEffect(() => {
-    const fetchOrders = async () => {
-      try {
-        const snapshot = await get(child(ref(database), "orders"))
-        if (snapshot.exists()) {
-          const data = snapshot.val()
-          // Ubah object ke array dan urutkan berdasarkan key (order_1, order_2, dst)
-          const formattedOrders = Object.keys(data)
-            .sort((a, b) => {
-               // Ekstrak angka dari "order_1", "order_10" agar urutannya benar
-               const numA = parseInt(a.split('_')[1] || "0")
-               const numB = parseInt(b.split('_')[1] || "0")
-               return numA - numB
-            })
-            .map(key => ({
-              id: key,
-              ...data[key]
-            }))
-          setOrders(formattedOrders)
-        }
-      } catch (error) {
-        console.error("Error fetching orders:", error)
-      }
-    }
-    fetchOrders()
-  }, [])
-
-  // 2. LISTENER GLOBAL TRACKING & LOGIKA ANTRIAN
-  useEffect(() => {
-    const trackingRef = ref(database, 'tracking')
+    const ordersRef = ref(database, 'orders')
     
-    const unsubscribe = onValue(trackingRef, (snapshot) => {
+    // Gunakan onValue agar realtime update saat ada order baru masuk atau order lama selesai
+    const unsubscribe = onValue(ordersRef, (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.val()
-        const newPicking = data.itemPicking || "Todo"
-        const newPackaging = data.packaging || "Todo"
-
-        setPickingStatus(newPicking)
-        setPackagingStatus(newPackaging)
-
-        // LOGIKA PINDAH ANTRIAN (AUTO SWITCH ORDER)
-        // Jika status Packaging berubah jadi DONE, anggap order ini selesai
-        // Dan jika Picking kembali ke TODO, berarti sistem siap untuk order berikutnya
-        if (newPackaging === "Done") {
-            // Kita tahan sebentar visualnya 'Done', lalu logic effect dibawah akan memindahkan index
-        }
+        const formattedOrders = Object.keys(data)
+          .map(key => ({
+            id: key,
+            ...data[key]
+          }))
+          // FILTER PENTING: Hanya ambil yang BELUM 'completed'
+          .filter((order: OrderData) => order.status !== 'completed')
+          .sort((a, b) => {
+             // Urutkan berdasarkan angka di ID (order_1, order_2)
+             const numA = parseInt(a.id.split('_')[1] || "0")
+             const numB = parseInt(b.id.split('_')[1] || "0")
+             return numA - numB
+          })
+        setOrders(formattedOrders)
+      } else {
+        setOrders([])
       }
     })
 
     return () => unsubscribe()
   }, [])
 
-  // 3. LOGIKA VISUAL TIMER & PERPINDAHAN STEP
+  // 2. LISTENER GLOBAL TRACKING
+  useEffect(() => {
+    const trackingRef = ref(database, 'tracking')
+    
+    const unsubscribe = onValue(trackingRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.val()
+        setPickingStatus(data.itemPicking || "Todo")
+        setPackagingStatus(data.packaging || "Todo")
+      }
+    })
+
+    return () => unsubscribe()
+  }, [])
+
+  // 3. RESET VISUAL SAAT GANTI ORDER
+  // Setiap kali activeOrder berubah (misal order 1 selesai, order 2 naik jadi activeOrder), reset semua
+  useEffect(() => {
+    if (activeOrder) {
+      setCurrentStep("idle")
+      setProgress(0)
+      if (progressInterval.current) clearInterval(progressInterval.current)
+      progressInterval.current = null
+    }
+  }, [activeOrder?.id]) // Jalankan hanya jika ID order berubah
+
+  // 4. LOGIKA VISUAL TIMER & PERPINDAHAN STEP
   useEffect(() => {
     const clearTimer = () => {
       if (progressInterval.current) clearInterval(progressInterval.current)
@@ -97,28 +99,25 @@ export default function OrderPage() {
       startTimeRef.current = null
     }
 
-    // --- FASE 0: IDLE / PERSIAPAN ---
-    // Jika semua Todo, reset progress
+    // Jika tidak ada order aktif, jangan jalankan logika
+    if (!activeOrder) return;
+
+    // --- FASE 0: IDLE ---
     if (pickingStatus === "Todo" && packagingStatus === "Todo") {
-        setCurrentStep("selecting") // Siap-siap di step 1
+        setCurrentStep("selecting") 
         setProgress(0)
         clearTimer()
-        
-        // Cek apakah order sebelumnya baru saja selesai? Jika ya, dan status sudah reset ke Todo,
-        // kita bisa pastikan UI menampilkan order berikutnya.
-        // (Logika perpindahan index ada di effect terpisah agar lebih aman)
     }
 
-    // --- FASE 1: PICKING (SELECTING) ---
-    else if (pickingStatus === "In Progress" && packagingStatus === "Todo") {
+    // --- FASE 1: PICKING ---
+    else if (pickingStatus === "In Progress") {
         setCurrentStep("selecting")
         if (!progressInterval.current) {
             startTimeRef.current = Date.now()
             progressInterval.current = setInterval(() => {
                 const elapsed = Date.now() - (startTimeRef.current || 0)
-                // Timer 60 Detik
-                let percent = (elapsed / 60000) * 100 
-                if (percent >= 99) percent = 99 // Stuck logic
+                let percent = (elapsed / 60000) * 100 // 60 Detik
+                if (percent >= 99) percent = 99
                 setProgress(percent)
             }, 100)
         }
@@ -126,8 +125,7 @@ export default function OrderPage() {
     else if (pickingStatus === "Done" && packagingStatus === "Todo") {
         clearTimer()
         setCurrentStep("selecting")
-        setProgress(100) // Penuhkan bar
-        // Otomatis visual pindah ke packaging siap-siap
+        setProgress(100)
         setTimeout(() => setProgress(0), 900) 
     }
 
@@ -138,9 +136,8 @@ export default function OrderPage() {
             startTimeRef.current = Date.now()
             progressInterval.current = setInterval(() => {
                 const elapsed = Date.now() - (startTimeRef.current || 0)
-                // Timer 30 Detik
-                let percent = (elapsed / 30000) * 100
-                if (percent >= 99) percent = 99 // Stuck logic
+                let percent = (elapsed / 30000) * 100 // 30 Detik
+                if (percent >= 99) percent = 99
                 setProgress(percent)
             }, 100)
         }
@@ -150,9 +147,7 @@ export default function OrderPage() {
         setCurrentStep("packaging")
         setProgress(100)
         
-        // --- LOGIKA TRIGGER SENDING & NEXT ORDER ---
-        // Karena "Sending" tidak ada di DB (sesuai request), kita jalankan animasi sending 
-        // setelah packaging Done, lalu pindah antrian.
+        // Trigger pengiriman setelah packaging selesai
         setTimeout(() => {
             setCurrentStep("sending")
             setProgress(0)
@@ -160,42 +155,49 @@ export default function OrderPage() {
     }
 
     return () => clearTimer()
-  }, [pickingStatus, packagingStatus])
+  }, [pickingStatus, packagingStatus, activeOrder])
 
 
-  // 4. LOGIKA PENGIRIMAN (SENDING) & SELESAI
-  // Ini berjalan murni di frontend setelah Packaging = Done
+  // 5. LOGIKA PENGIRIMAN & PENYELESAIAN ORDER (UPDATE DATABASE)
   useEffect(() => {
     if (currentStep === "sending") {
         let localProgress = 0
         const interval = setInterval(() => {
-            // 5 Detik durasi sending
-            localProgress += (100 / 50) 
+            localProgress += (100 / 50) // 5 Detik
             
             if (localProgress >= 100) {
                 localProgress = 100
                 clearInterval(interval)
                 setCurrentStep("completed")
                 
-                // --- KUNCI: PINDAH KE ORDER BERIKUTNYA ---
-                // Setelah animasi sending selesai, kita cek antrian.
-                // Kita tambahkan delay agar user sempat melihat "Order Complete"
-                setTimeout(() => {
-                    if (activeOrderIndex < orders.length - 1) {
-                        // Pindah ke order berikutnya
-                        setActiveOrderIndex(prev => prev + 1)
-                        // Reset visual
-                        setCurrentStep("idle")
-                        setProgress(0)
+                // --- UPDATE DATABASE DISINI ---
+                setTimeout(async () => {
+                    if (activeOrder) {
+                        try {
+                            // 1. Tandai order ini sebagai selesai (akan hilang dari list karena filter)
+                            await update(ref(database, `orders/${activeOrder.id}`), {
+                                status: 'completed'
+                            })
+                            
+                            // 2. PENTING: Reset tracking hardware ke 'Todo' agar robot tau order ini selesai 
+                            // dan siap mengambil order berikutnya (jika ada)
+                            await update(ref(database, 'tracking'), {
+                                itemPicking: 'Todo',
+                                packaging: 'Todo'
+                            })
+                            
+                            console.log(`Order ${activeOrder.id} completed & tracking reset.`)
+                        } catch (e) {
+                            console.error("Error updating db", e)
+                        }
                     }
-                    // Jika order habis, dia akan diam di completed pada order terakhir
-                }, 3000)
+                }, 3000) // Delay 3 detik agar user lihat pesan "Order Complete"
             }
             setProgress(localProgress)
         }, 100)
         return () => clearInterval(interval)
     }
-  }, [currentStep, activeOrderIndex, orders.length])
+  }, [currentStep, activeOrder])
 
 
   // --- Helper UI ---
@@ -216,14 +218,14 @@ export default function OrderPage() {
     {
       id: "selecting" as const,
       title: "Item Picking",
-      description: pickingStatus === "In Progress" ? "Robot is picking items (60s limit)..." : "Waiting for robot...",
+      description: pickingStatus === "In Progress" ? "Robot is picking items..." : "Waiting for robot...",
       icon: CheckCircle2,
       dbStatus: pickingStatus
     },
     {
       id: "packaging" as const,
       title: "Packaging",
-      description: packagingStatus === "In Progress" ? "Packing items (30s limit)..." : "Waiting for items...",
+      description: packagingStatus === "In Progress" ? "Packing items..." : "Waiting for items...",
       icon: Box,
       dbStatus: packagingStatus
     },
@@ -236,13 +238,17 @@ export default function OrderPage() {
     },
   ]
 
-  // Jika tidak ada order sama sekali
-  if (orders.length === 0) {
+  // Tampilan jika semua order selesai
+  if (!activeOrder) {
     return (
-        <div className="min-h-screen bg-background flex items-center justify-center">
-            <div className="text-center">
-                <Loader2 className="w-10 h-10 animate-spin mx-auto mb-4 text-primary" />
-                <p>Loading Orders...</p>
+        <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
+            <div className="text-center space-y-4">
+                <CheckCircle2 className="w-20 h-20 text-green-500 mx-auto animate-pulse" />
+                <h1 className="text-3xl font-bold text-foreground">All Orders Completed!</h1>
+                <p className="text-muted-foreground">Waiting for new orders from store...</p>
+                <Link href="/">
+                    <Button variant="outline" className="mt-4">Back to Store</Button>
+                </Link>
             </div>
         </div>
     )
@@ -265,12 +271,12 @@ export default function OrderPage() {
       {/* Main Content */}
       <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
         <div className="text-center mb-12">
-            <div className="inline-flex items-center justify-center px-4 py-1.5 mb-4 rounded-full bg-primary/10 text-primary text-sm font-medium">
-                Queue Position: {activeOrderIndex + 1} of {orders.length}
+            <div className="inline-flex items-center justify-center px-4 py-1.5 mb-4 rounded-full bg-primary/10 text-primary text-sm font-medium animate-in fade-in slide-in-from-top-4">
+                Queue: {orders.length} Remaining
             </div>
             
           <h1 className="text-4xl font-bold text-foreground mb-2">
-             {activeOrder ? `Processing ${activeOrder.id.replace('_', ' #')}` : "All Orders Completed"}
+             Processing {activeOrder.id.replace('_', ' #')}
           </h1>
           <p className="text-muted-foreground">
             Real-time Manufacturing Execution System
@@ -282,7 +288,6 @@ export default function OrderPage() {
           <div className="w-full h-4 bg-muted rounded-full overflow-hidden relative">
             <div 
                 className={`h-full transition-all duration-300 ease-out ${
-                    // Ubah warna bar jika stuck (99% dan belum done)
                     (pickingStatus === "In Progress" || packagingStatus === "In Progress") && progress >= 99 
                     ? "bg-yellow-500" 
                     : "bg-primary"
@@ -293,13 +298,10 @@ export default function OrderPage() {
           <div className="flex justify-between mt-2">
              <p className="text-sm font-mono font-bold">{Math.round(progress)}%</p>
              <p className="text-sm font-medium text-primary animate-pulse">
-                {/* Status Message Logic */}
                 {currentStep === 'selecting' && pickingStatus === "In Progress" && progress < 99 && "Robot Moving..."}
                 {currentStep === 'selecting' && pickingStatus === "In Progress" && progress >= 99 && "Waiting for Picking DONE..."}
-                
                 {currentStep === 'packaging' && packagingStatus === "In Progress" && progress < 99 && "Packing in progress..."}
                 {currentStep === 'packaging' && packagingStatus === "In Progress" && progress >= 99 && "Waiting for Packaging DONE..."}
-                
                 {currentStep === 'sending' && "Dispatching..."}
              </p>
           </div>
@@ -307,7 +309,7 @@ export default function OrderPage() {
 
         {/* Steps */}
         <div className="space-y-6 mb-12">
-          {steps.map((step, index) => {
+          {steps.map((step) => {
             const status = getStepStatus(step.id)
             const Icon = step.icon
 
@@ -340,9 +342,6 @@ export default function OrderPage() {
                         {status === "active" && step.dbStatus === "In Progress" && (
                             <span className="ml-2 text-xs bg-blue-200 text-blue-800 px-2 py-0.5 rounded-full">In Progress</span>
                         )}
-                         {status === "active" && step.dbStatus === "Done" && (
-                            <span className="ml-2 text-xs bg-green-200 text-green-800 px-2 py-0.5 rounded-full">Done</span>
-                        )}
                       </h3>
                       <p className="text-sm text-muted-foreground">{step.description}</p>
                     </div>
@@ -358,10 +357,10 @@ export default function OrderPage() {
           <div className="p-8 bg-green-50 border-2 border-green-300 rounded-lg text-center dark:bg-green-950 dark:border-green-700 animate-in zoom-in duration-300">
             <CheckCircle2 className="w-16 h-16 text-green-600 dark:text-green-400 mx-auto mb-4" />
             <h2 className="text-3xl font-bold text-green-700 dark:text-green-300 mb-2">
-                {activeOrder ? `${activeOrder.id} Completed!` : "Order Completed!"}
+                Order Completed!
             </h2>
             <p className="text-green-600 dark:text-green-400 mb-6">
-              Preparing next order in queue...
+              System is resetting for the next order...
             </p>
           </div>
         )}
