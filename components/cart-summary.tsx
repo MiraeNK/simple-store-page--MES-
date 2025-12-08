@@ -3,71 +3,77 @@
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { useCart } from "@/lib/cart-context"
-import { Minus, Plus, Trash2, Loader2 } from "lucide-react" // Tambah Loader2
+import { Minus, Plus, Trash2, Loader2 } from "lucide-react"
 import { useState } from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-// Import Firebase functions
-import { ref, get, child, set } from "firebase/database"
+import { ref, push, set, update, get } from "firebase/database"
 import { database } from "@/lib/firebase"
 
 export default function CartSummary() {
   const { items, updateQuantity, removeItem, total, clearCart } = useCart()
-  const [orderPlaced, setOrderPlaced] = useState(false)
-  const [isSubmitting, setIsSubmitting] = useState(false) // State loading
+  const [isSubmitting, setIsSubmitting] = useState(false)
   const router = useRouter()
 
   const handlePlaceOrder = async () => {
     if (items.length === 0) return;
-
     setIsSubmitting(true);
 
     try {
-      const dbRef = ref(database);
-      const ordersRef = child(dbRef, "orders");
+      // 1. Cek dulu apakah mesin sedang sibuk? (Optional safety)
+      // Kalau mesin sibuk, idealnya kita tolak atau tetap masuk antrian saja.
+      // Tapi sesuai permintaan "langsung masukkan", kita hajar update live_order.
 
-      // 1. Ambil snapshot data 'orders' untuk menghitung jumlah order saat ini
-      const snapshot = await get(ordersRef);
+      // A. Simpan data lengkap ke 'orders' (Log/History Antrian)
+      const ordersRef = ref(database, "orders");
+      const newOrderRef = push(ordersRef);
       
-      let nextOrderIndex = 1;
-      if (snapshot.exists()) {
-        // Hitung jumlah key yang ada di dalam orders, lalu tambah 1
-        nextOrderIndex = Object.keys(snapshot.val()).length + 1;
-      }
-
-      const newOrderId = `order_${nextOrderIndex}`;
-
-      // 2. Siapkan data yang akan disimpan (Hanya ID dan Quantity sesuai request, atau detail lengkap)
-      // Disini saya simpan ID dan Qty agar datanya berguna
-      const orderData = items.map((item) => ({
-        id: item.id,
-        name: item.name, // Opsional: Hapus jika hanya ingin ID murni
-        quantity: item.quantity,
-        price: item.price
-      }));
-
-      // Tambahkan timestamp agar tau kapan order dibuat
-      const finalPayload = {
-        items: orderData,
+      const orderPayload = {
+        id: newOrderRef.key, 
+        items: items.map(item => ({
+            id: item.id,
+            name: item.name,
+            price: item.price,
+            quantity: item.quantity
+        })),
         totalAmount: total,
+        status: 'processing', // Langsung set processing karena langsung dikirim ke mesin
         createdAt: new Date().toISOString()
       };
 
-      // 3. Simpan ke Firebase: orders/order_n
-      await set(child(ordersRef, newOrderId), finalPayload);
+      // Simpan Log Order
+      await set(newOrderRef, orderPayload);
 
-      // 4. Sukses
-      setOrderPlaced(true);
-      clearCart();
+      // B. UPDATE LIVE ORDER (LANGSUNG ISI KUANTITAS KE MEMORI MESIN)
+      // Kita perlu membaca struktur live_order dulu untuk tau index array-nya (0,1,2,3)
+      // Asumsi: items di live_order urut index 0=id1, 1=id2, 2=id3, 3=id4
       
-      // Delay sebentar agar user melihat pesan sukses sebelum redirect
-      setTimeout(() => {
-        router.push("/order");
-      }, 1500);
+      const updates: any = {};
+      
+      // Reset dulu live_order biar bersih (atau ambil data lama + baru jika mau akumulasi)
+      // Disini kita timpa sesuai order baru
+      
+      items.forEach(item => {
+          // Mapping ID produk ke Index Array Live Order
+          // ID "1" -> Index 0
+          // ID "2" -> Index 1
+          const itemIndex = parseInt(item.id) - 1; 
+          
+          if (itemIndex >= 0 && itemIndex <= 3) {
+              updates[`live_order/items/${itemIndex}/quantity`] = item.quantity;
+          }
+      });
+
+      // Kirim perintah ke mesin!
+      await update(ref(database), updates);
+
+      // 3. Bersihkan Cart & Redirect
+      clearCart();
+      router.push("/order"); 
 
     } catch (error) {
-      console.error("Error placing order to Firebase:", error);
-      alert("Failed to place order. Check console.");
+      console.error("Error placing order:", error);
+      alert("Failed to place order.");
     } finally {
       setIsSubmitting(false);
     }
@@ -75,12 +81,7 @@ export default function CartSummary() {
 
   return (
     <div className="lg:col-span-3">
-      {orderPlaced && (
-        <div className="mb-4 p-4 bg-green-50 border border-green-200 rounded-lg text-green-800">
-          ✓ Order placed successfully! Saving to database...
-        </div>
-      )}
-
+      {/* ... (BAGIAN UI KARTU BARANG TETAP SAMA) ... */}
       <div className="space-y-4 mb-6">
         {items.map((item) => (
           <Card key={item.id} className="p-4">
@@ -99,12 +100,7 @@ export default function CartSummary() {
                   <Button size="sm" variant="outline" onClick={() => updateQuantity(item.id, item.quantity + 1)}>
                     <Plus className="w-4 h-4" />
                   </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="ml-auto text-destructive"
-                    onClick={() => removeItem(item.id)}
-                  >
+                  <Button size="sm" variant="ghost" className="ml-auto text-destructive" onClick={() => removeItem(item.id)}>
                     <Trash2 className="w-4 h-4" />
                   </Button>
                 </div>
@@ -117,7 +113,6 @@ export default function CartSummary() {
         ))}
       </div>
 
-      {/* Order Summary */}
       <Card className="p-6 bg-card border border-border">
         <h2 className="text-xl font-bold text-foreground mb-4">Order Summary</h2>
         <div className="space-y-2 mb-6">
@@ -137,23 +132,10 @@ export default function CartSummary() {
         <Button 
           onClick={handlePlaceOrder} 
           disabled={items.length === 0 || isSubmitting} 
-          className="w-full" 
-          size="lg"
+          className="w-full" size="lg"
         >
-          {isSubmitting ? (
-            <>
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              Processing...
-            </>
-          ) : (
-            "Place Order"
-          )}
+          {isSubmitting ? <><Loader2 className="mr-2 h-4 w-4 animate-spin"/> Sending to Machine...</> : "Place Order"}
         </Button>
-        <Link href="/" className="block mt-3">
-          <Button variant="outline" className="w-full bg-transparent">
-            Continue Shopping
-          </Button>
-        </Link>
       </Card>
     </div>
   )

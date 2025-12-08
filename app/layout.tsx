@@ -36,7 +36,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className={`font-sans antialiased`}>
+      {/* Tambahkan suppressHydrationWarning di sini */}
+      <body 
+        className={`font-sans antialiased`}
+        suppressHydrationWarning={true} 
+      >
         {children}
         <Analytics />
       </body>

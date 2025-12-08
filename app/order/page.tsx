@@ -1,370 +1,306 @@
 "use client"
 
-import { useEffect, useState, useRef, useMemo } from "react"
+import { useEffect, useState, useMemo, useRef } from "react"
 import Link from "next/link"
-import { ChevronLeft, CheckCircle2, Box, Truck, Loader2 } from "lucide-react"
+import { ChevronLeft, CheckCircle2, Box, Truck, RefreshCw, FileClock } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { database } from "@/lib/firebase"
-import { ref, onValue, update, child } from "firebase/database" // Import update
+import { ref, onValue, update, remove, set } from "firebase/database"
 
-type OrderStep = "idle" | "selecting" | "packaging" | "sending" | "completed"
-type DBStatus = "Todo" | "In Progress" | "Done"
+type DBStatus = "Todo" | "OnProgress" | "Done"
 
 interface OrderData {
   id: string
   items: any[]
-  status?: string // Tambahan status
-  // properti lain
+  status: 'queued' | 'processing'
+  createdAt: string
+  totalAmount: number
+}
+
+interface LiveItem {
+  id: string
+  quantity: number
+  name: string
+}
+
+interface TrackingData {
+  itemPicking: DBStatus
+  packaging: DBStatus
+  sending: DBStatus
 }
 
 export default function OrderPage() {
-  // --- STATE ---
   const [orders, setOrders] = useState<OrderData[]>([])
-  // Kita selalu memproses order pertama di antrian (FIFO)
-  const activeOrder = useMemo(() => orders[0], [orders])
+  const [liveItems, setLiveItems] = useState<LiveItem[]>([])
+  const [tracking, setTracking] = useState<TrackingData>({
+    itemPicking: "Todo",
+    packaging: "Todo",
+    sending: "Todo"
+  })
   
-  // Tracking Status (Global dari node 'tracking')
-  const [pickingStatus, setPickingStatus] = useState<DBStatus>("Todo")
-  const [packagingStatus, setPackagingStatus] = useState<DBStatus>("Todo")
-
-  // Visual Progress
-  const [currentStep, setCurrentStep] = useState<OrderStep>("idle")
+  // Timer visual progress (hanya untuk UX)
   const [progress, setProgress] = useState(0)
 
-  // Timer Refs
-  const progressInterval = useRef<NodeJS.Timeout | null>(null)
-  const startTimeRef = useRef<number | null>(null)
+  // Ambil order aktif (yang sedang diproses atau antrian terdepan)
+  const activeOrder = useMemo(() => {
+    return orders.find(o => o.status === 'processing') || orders.find(o => o.status === 'queued')
+  }, [orders])
 
-  // 1. FETCH & FILTER ORDER (REALTIME)
+  // --- 1. FETCH DATA (REALTIME) ---
   useEffect(() => {
+    // Fetch Orders
     const ordersRef = ref(database, 'orders')
-    
-    // Gunakan onValue agar realtime update saat ada order baru masuk atau order lama selesai
-    const unsubscribe = onValue(ordersRef, (snapshot) => {
+    const unsubOrders = onValue(ordersRef, (snapshot) => {
       if (snapshot.exists()) {
         const data = snapshot.val()
-        const formattedOrders = Object.keys(data)
-          .map(key => ({
-            id: key,
-            ...data[key]
-          }))
-          // FILTER PENTING: Hanya ambil yang BELUM 'completed'
-          .filter((order: OrderData) => order.status !== 'completed')
-          .sort((a, b) => {
-             // Urutkan berdasarkan angka di ID (order_1, order_2)
-             const numA = parseInt(a.id.split('_')[1] || "0")
-             const numB = parseInt(b.id.split('_')[1] || "0")
-             return numA - numB
-          })
-        setOrders(formattedOrders)
+        const list = Object.keys(data).map(key => ({ id: key, ...data[key] }))
+        // Urutkan FIFO
+        const queue = list.sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+        setOrders(queue)
       } else {
         setOrders([])
       }
     })
 
-    return () => unsubscribe()
-  }, [])
+    // Fetch Live Order (Status Handshake)
+    const liveRef = ref(database, 'live_order/items')
+    const unsubLive = onValue(liveRef, (snapshot) => {
+      if (snapshot.exists()) setLiveItems(snapshot.val())
+    })
 
-  // 2. LISTENER GLOBAL TRACKING
-  useEffect(() => {
-    const trackingRef = ref(database, 'tracking')
-    
-    const unsubscribe = onValue(trackingRef, (snapshot) => {
+    // Fetch Tracking (Status Proses)
+    const trackRef = ref(database, 'tracking')
+    const unsubTrack = onValue(trackRef, (snapshot) => {
       if (snapshot.exists()) {
-        const data = snapshot.val()
-        setPickingStatus(data.itemPicking || "Todo")
-        setPackagingStatus(data.packaging || "Todo")
+        setTracking(snapshot.val())
+      } else {
+        // Init jika kosong
+        setTracking({ itemPicking: "Todo", packaging: "Todo", sending: "Todo" })
       }
     })
 
-    return () => unsubscribe()
+    return () => {
+      unsubOrders()
+      unsubLive()
+      unsubTrack()
+    }
   }, [])
 
-  // 3. RESET VISUAL SAAT GANTI ORDER
-  // Setiap kali activeOrder berubah (misal order 1 selesai, order 2 naik jadi activeOrder), reset semua
+  // --- 2. LOGIKA CONTROLLER (MANAGER) ---
   useEffect(() => {
-    if (activeOrder) {
-      setCurrentStep("idle")
-      setProgress(0)
-      if (progressInterval.current) clearInterval(progressInterval.current)
-      progressInterval.current = null
-    }
-  }, [activeOrder?.id]) // Jalankan hanya jika ID order berubah
+    if (!activeOrder || liveItems.length === 0) return
 
-  // 4. LOGIKA VISUAL TIMER & PERPINDAHAN STEP
+    // Cek apakah mesin "kosong" (siap menerima data baru)
+    // Mesin dianggap kosong jika quantity di live_order 0 semua DAN tracking semua Todo
+    const isMachineSlotEmpty = liveItems.every(item => item.quantity === 0)
+    const isTrackingIdle = tracking.itemPicking === "Todo" && tracking.packaging === "Todo" && tracking.sending === "Todo"
+
+    // A. KIRIM ORDER KE MESIN
+    if (isMachineSlotEmpty && isTrackingIdle && activeOrder.status === 'queued') {
+      console.log(`[SYSTEM] Sending Order ${activeOrder.id} to Hardware...`)
+      
+      const updates: any = {}
+      updates[`orders/${activeOrder.id}/status`] = 'processing'
+
+      // Masukkan quantity ke live_order
+      activeOrder.items.forEach((orderItem: any) => {
+        const targetIndex = liveItems.findIndex(li => li.id === orderItem.id)
+        if (targetIndex !== -1) {
+            updates[`live_order/items/${targetIndex}/quantity`] = orderItem.quantity
+        }
+      })
+
+      update(ref(database), updates)
+    }
+
+    // B. PINDAHKAN KE HISTORY (JIKA SUDAH SELESAI)
+    // Syarat Selesai: Status Sending = Done
+    if (tracking.sending === "Done" && activeOrder.status === 'processing') {
+      console.log(`[SYSTEM] Order ${activeOrder.id} Finished! Moving to History...`)
+      
+      const finalizeOrder = async () => {
+        // 1. Simpan ke folder 'order_history'
+        await set(ref(database, `order_history/${activeOrder.id}`), {
+            ...activeOrder,
+            status: 'completed',
+            completedAt: new Date().toISOString()
+        })
+
+        // 2. Hapus dari folder 'orders' (antrian)
+        await remove(ref(database, `orders/${activeOrder.id}`))
+
+        // 3. Reset Tracking untuk order berikutnya
+        await update(ref(database, 'tracking'), {
+            itemPicking: "Todo",
+            packaging: "Todo",
+            sending: "Todo"
+        })
+      }
+
+      finalizeOrder()
+    }
+
+  }, [activeOrder, liveItems, tracking])
+
+
+  // --- 3. LOGIKA VISUAL PROGRESS BAR ---
   useEffect(() => {
-    const clearTimer = () => {
-      if (progressInterval.current) clearInterval(progressInterval.current)
-      progressInterval.current = null
-      startTimeRef.current = null
-    }
-
-    // Jika tidak ada order aktif, jangan jalankan logika
-    if (!activeOrder) return;
-
-    // --- FASE 0: IDLE ---
-    if (pickingStatus === "Todo" && packagingStatus === "Todo") {
-        setCurrentStep("selecting") 
+    if (!activeOrder) {
         setProgress(0)
-        clearTimer()
+        return
     }
 
-    // --- FASE 1: PICKING ---
-    else if (pickingStatus === "In Progress") {
-        setCurrentStep("selecting")
-        if (!progressInterval.current) {
-            startTimeRef.current = Date.now()
-            progressInterval.current = setInterval(() => {
-                const elapsed = Date.now() - (startTimeRef.current || 0)
-                let percent = (elapsed / 60000) * 100 // 60 Detik
-                if (percent >= 99) percent = 99
-                setProgress(percent)
-            }, 100)
-        }
-    }
-    else if (pickingStatus === "Done" && packagingStatus === "Todo") {
-        clearTimer()
-        setCurrentStep("selecting")
-        setProgress(100)
-        setTimeout(() => setProgress(0), 900) 
-    }
+    // Tentukan target persentase berdasarkan status tracking
+    let target = 0
+    if (tracking.itemPicking === "In Progress") target = 33
+    if (tracking.itemPicking === "Done") target = 33
+    if (tracking.packaging === "In Progress") target = 66
+    if (tracking.packaging === "Done") target = 66
+    if (tracking.sending === "In Progress") target = 90
+    if (tracking.sending === "Done") target = 100
 
-    // --- FASE 2: PACKAGING ---
-    else if (packagingStatus === "In Progress") {
-        setCurrentStep("packaging")
-        if (!progressInterval.current) {
-            startTimeRef.current = Date.now()
-            progressInterval.current = setInterval(() => {
-                const elapsed = Date.now() - (startTimeRef.current || 0)
-                let percent = (elapsed / 30000) * 100 // 30 Detik
-                if (percent >= 99) percent = 99
-                setProgress(percent)
-            }, 100)
-        }
-    }
-    else if (packagingStatus === "Done") {
-        clearTimer()
-        setCurrentStep("packaging")
-        setProgress(100)
-        
-        // Trigger pengiriman setelah packaging selesai
-        setTimeout(() => {
-            setCurrentStep("sending")
-            setProgress(0)
-        }, 1000)
-    }
+    // Animasi smooth
+    const interval = setInterval(() => {
+        setProgress(prev => {
+            if (prev < target) return prev + 1
+            if (prev > target) return target // Langsung lompat jika mundur (reset)
+            return prev
+        })
+    }, 50) // Kecepatan animasi
 
-    return () => clearTimer()
-  }, [pickingStatus, packagingStatus, activeOrder])
+    return () => clearInterval(interval)
+  }, [tracking, activeOrder])
 
 
-  // 5. LOGIKA PENGIRIMAN & PENYELESAIAN ORDER (UPDATE DATABASE)
-  useEffect(() => {
-    if (currentStep === "sending") {
-        let localProgress = 0
-        const interval = setInterval(() => {
-            localProgress += (100 / 50) // 5 Detik
-            
-            if (localProgress >= 100) {
-                localProgress = 100
-                clearInterval(interval)
-                setCurrentStep("completed")
-                
-                // --- UPDATE DATABASE DISINI ---
-                setTimeout(async () => {
-                    if (activeOrder) {
-                        try {
-                            // 1. Tandai order ini sebagai selesai (akan hilang dari list karena filter)
-                            await update(ref(database, `orders/${activeOrder.id}`), {
-                                status: 'completed'
-                            })
-                            
-                            // 2. PENTING: Reset tracking hardware ke 'Todo' agar robot tau order ini selesai 
-                            // dan siap mengambil order berikutnya (jika ada)
-                            await update(ref(database, 'tracking'), {
-                                itemPicking: 'Todo',
-                                packaging: 'Todo'
-                            })
-                            
-                            console.log(`Order ${activeOrder.id} completed & tracking reset.`)
-                        } catch (e) {
-                            console.error("Error updating db", e)
-                        }
-                    }
-                }, 3000) // Delay 3 detik agar user lihat pesan "Order Complete"
-            }
-            setProgress(localProgress)
-        }, 100)
-        return () => clearInterval(interval)
-    }
-  }, [currentStep, activeOrder])
-
-
-  // --- Helper UI ---
-  const getStepStatus = (stepId: OrderStep) => {
-    const stepOrder = ["selecting", "packaging", "sending"]
-    const currentIndex = stepOrder.indexOf(currentStep)
-    const stepIndex = stepOrder.indexOf(stepId)
-
-    if (currentStep === "completed") return "completed"
-    if (currentStep === "idle") return "pending"
-
-    if (stepIndex < currentIndex) return "completed"
-    if (stepIndex === currentIndex) return "active"
+  // --- Helper Status Visual ---
+  const getStepStatus = (stepName: keyof TrackingData) => {
+    const status = tracking[stepName]
+    if (status === "Done") return "completed"
+    if (status === "In Progress") return "active"
     return "pending"
   }
 
-  const steps = [
-    {
-      id: "selecting" as const,
-      title: "Item Picking",
-      description: pickingStatus === "In Progress" ? "Robot is picking items..." : "Waiting for robot...",
-      icon: CheckCircle2,
-      dbStatus: pickingStatus
-    },
-    {
-      id: "packaging" as const,
-      title: "Packaging",
-      description: packagingStatus === "In Progress" ? "Packing items..." : "Waiting for items...",
-      icon: Box,
-      dbStatus: packagingStatus
-    },
-    {
-      id: "sending" as const,
-      title: "Sending",
-      description: "On the way to customer",
-      icon: Truck,
-      dbStatus: currentStep === "sending" || currentStep === "completed" ? "In Progress" : "Todo"
-    },
-  ]
-
-  // Tampilan jika semua order selesai
+  // Jika tidak ada order
   if (!activeOrder) {
     return (
         <div className="min-h-screen bg-background flex flex-col items-center justify-center p-4">
-            <div className="text-center space-y-4">
-                <CheckCircle2 className="w-20 h-20 text-green-500 mx-auto animate-pulse" />
-                <h1 className="text-3xl font-bold text-foreground">All Orders Completed!</h1>
-                <p className="text-muted-foreground">Waiting for new orders from store...</p>
-                <Link href="/">
-                    <Button variant="outline" className="mt-4">Back to Store</Button>
-                </Link>
+            <CheckCircle2 className="w-20 h-20 text-green-500 mb-4 animate-bounce" />
+            <h1 className="text-2xl font-bold">System Idle</h1>
+            <p className="text-muted-foreground mb-6">Waiting for new orders...</p>
+            <div className="flex gap-4">
+                <Link href="/"><Button variant="outline">Store</Button></Link>
+                <Link href="/history"><Button>View History Log</Button></Link>
             </div>
         </div>
     )
   }
 
+  // Cek apakah hardware sudah menerima data (Quantity di live_order jadi 0 lagi)
+  // Jika live_order masih ada isinya, berarti hardware BELUM menerima (masih di buffer)
+  const isDataReceivedByHardware = liveItems.every(item => item.quantity === 0) && activeOrder.status === 'processing'
+
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
       <header className="sticky top-0 z-50 border-b border-border bg-background">
-        <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <Link href="/">
-            <Button variant="ghost" className="gap-2">
-              <ChevronLeft className="w-5 h-5" />
-              Store Dashboard
-            </Button>
-          </Link>
+        <div className="max-w-4xl mx-auto px-4 py-4 flex justify-between items-center">
+            <Link href="/"><Button variant="ghost"><ChevronLeft className="w-4 h-4 mr-2"/>Dashboard</Button></Link>
+            <Link href="/history">
+                <Button variant="outline" size="sm" className="gap-2">
+                    <FileClock className="w-4 h-4" /> Log History
+                </Button>
+            </Link>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+      <main className="max-w-4xl mx-auto px-4 py-12">
         <div className="text-center mb-12">
-            <div className="inline-flex items-center justify-center px-4 py-1.5 mb-4 rounded-full bg-primary/10 text-primary text-sm font-medium animate-in fade-in slide-in-from-top-4">
-                Queue: {orders.length} Remaining
+            <div className="inline-block mb-2 px-3 py-1 bg-muted rounded-full text-xs font-mono">
+                Order ID: {activeOrder.id}
             </div>
             
-          <h1 className="text-4xl font-bold text-foreground mb-2">
-             Processing {activeOrder.id.replace('_', ' #')}
-          </h1>
-          <p className="text-muted-foreground">
-            Real-time Manufacturing Execution System
-          </p>
+            <h1 className="text-4xl font-bold mb-4 transition-all">
+                {!isDataReceivedByHardware && activeOrder.status === 'processing' 
+                    ? "Sending Data to Hardware..." 
+                    : "Hardware Processing..."}
+            </h1>
+
+            {/* Progress Bar Global */}
+            <div className="w-full h-4 bg-muted rounded-full overflow-hidden mt-6 mb-2 relative">
+                <div 
+                    className="h-full bg-primary transition-all duration-300 ease-out"
+                    style={{ width: `${progress}%` }} 
+                />
+            </div>
+            <p className="text-xs text-muted-foreground">{Math.round(progress)}% Complete</p>
         </div>
 
-        {/* Progress Bar */}
-        <div className="mb-12">
-          <div className="w-full h-4 bg-muted rounded-full overflow-hidden relative">
-            <div 
-                className={`h-full transition-all duration-300 ease-out ${
-                    (pickingStatus === "In Progress" || packagingStatus === "In Progress") && progress >= 99 
-                    ? "bg-yellow-500" 
-                    : "bg-primary"
-                }`}
-                style={{ width: `${progress}%` }} 
+        {/* Steps Visualization */}
+        <div className="grid gap-4 mb-12">
+            {/* Step 1: Picking */}
+            <StepCard 
+                title="1. Item Picking" 
+                desc="Robot arm picking items from inventory"
+                icon={CheckCircle2}
+                status={getStepStatus("itemPicking")}
             />
-          </div>
-          <div className="flex justify-between mt-2">
-             <p className="text-sm font-mono font-bold">{Math.round(progress)}%</p>
-             <p className="text-sm font-medium text-primary animate-pulse">
-                {currentStep === 'selecting' && pickingStatus === "In Progress" && progress < 99 && "Robot Moving..."}
-                {currentStep === 'selecting' && pickingStatus === "In Progress" && progress >= 99 && "Waiting for Picking DONE..."}
-                {currentStep === 'packaging' && packagingStatus === "In Progress" && progress < 99 && "Packing in progress..."}
-                {currentStep === 'packaging' && packagingStatus === "In Progress" && progress >= 99 && "Waiting for Packaging DONE..."}
-                {currentStep === 'sending' && "Dispatching..."}
-             </p>
-          </div>
+            {/* Step 2: Packaging */}
+            <StepCard 
+                title="2. Packaging" 
+                desc="Conveyor belt moving to packaging area"
+                icon={Box}
+                status={getStepStatus("packaging")}
+            />
+            {/* Step 3: Sending */}
+            <StepCard 
+                title="3. Sending" 
+                desc="Final dispatch process"
+                icon={Truck}
+                status={getStepStatus("sending")}
+            />
         </div>
 
-        {/* Steps */}
-        <div className="space-y-6 mb-12">
-          {steps.map((step) => {
-            const status = getStepStatus(step.id)
-            const Icon = step.icon
-
-            return (
-              <div key={step.id}>
-                <div
-                  className={`p-6 rounded-lg border-2 transition-all duration-500 ${
-                    status === "completed"
-                      ? "bg-green-50 border-green-300 dark:bg-green-950 dark:border-green-700"
-                      : status === "active"
-                        ? "bg-blue-50 border-blue-300 dark:bg-blue-950 dark:border-blue-700 scale-105 shadow-lg"
-                        : "bg-muted border-border opacity-50"
-                  }`}
-                >
-                  <div className="flex items-start gap-4">
-                    <div
-                      className={`flex-shrink-0 transition-all duration-500 ${
-                        status === "completed"
-                          ? "text-green-600 dark:text-green-400 scale-110"
-                          : status === "active"
-                            ? "text-blue-600 dark:text-blue-400 animate-bounce"
-                            : "text-muted-foreground"
-                      }`}
-                    >
-                      <Icon className="w-8 h-8" />
+        {/* Live Data Monitor (Optional: Untuk Debugging User) */}
+        <div className="bg-slate-50 dark:bg-slate-900 border rounded-xl p-6">
+            <h3 className="font-semibold mb-4 text-sm uppercase text-muted-foreground flex items-center gap-2">
+                <RefreshCw className={`w-3 h-3 ${!isDataReceivedByHardware && activeOrder.status === 'processing' ? 'animate-spin' : ''}`}/>
+                Live Hardware Buffer
+            </h3>
+            <div className="grid grid-cols-4 gap-4">
+                {liveItems.map((item) => (
+                    <div key={item.id} className={`text-center p-3 rounded border ${item.quantity > 0 ? 'bg-blue-100 border-blue-300 text-blue-800' : 'bg-background opacity-50'}`}>
+                        <div className="text-xl font-bold">{item.quantity}</div>
+                        <div className="text-[10px] truncate">{item.name}</div>
                     </div>
-                    <div className="flex-1">
-                      <h3 className="text-lg font-bold mb-1">
-                        {step.title}
-                        {status === "active" && step.dbStatus === "In Progress" && (
-                            <span className="ml-2 text-xs bg-blue-200 text-blue-800 px-2 py-0.5 rounded-full">In Progress</span>
-                        )}
-                      </h3>
-                      <p className="text-sm text-muted-foreground">{step.description}</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )
-          })}
-        </div>
-
-        {/* Completion Message */}
-        {currentStep === "completed" && (
-          <div className="p-8 bg-green-50 border-2 border-green-300 rounded-lg text-center dark:bg-green-950 dark:border-green-700 animate-in zoom-in duration-300">
-            <CheckCircle2 className="w-16 h-16 text-green-600 dark:text-green-400 mx-auto mb-4" />
-            <h2 className="text-3xl font-bold text-green-700 dark:text-green-300 mb-2">
-                Order Completed!
-            </h2>
-            <p className="text-green-600 dark:text-green-400 mb-6">
-              System is resetting for the next order...
+                ))}
+            </div>
+            <p className="text-[10px] text-muted-foreground mt-2 text-center">
+                *Jika angka 0, hardware belum mengambil data. Jika 0, hardware sedang memproses.
             </p>
-          </div>
-        )}
+        </div>
       </main>
     </div>
   )
+}
+
+// Komponen Kecil untuk Step UI
+function StepCard({ title, desc, icon: Icon, status }: { title: string, desc: string, icon: any, status: string }) {
+    const isActive = status === 'active'
+    const isDone = status === 'completed'
+    
+    return (
+        <div className={`p-4 rounded-lg border flex items-center gap-4 transition-all duration-300 
+            ${isActive ? 'border-blue-500 bg-blue-50/50 shadow-md scale-[1.02]' : ''}
+            ${isDone ? 'border-green-500 bg-green-50/50 opacity-80' : 'bg-card'}
+        `}>
+            <div className={`p-3 rounded-full ${isActive ? 'bg-blue-100 text-blue-600 animate-pulse' : isDone ? 'bg-green-100 text-green-600' : 'bg-muted text-muted-foreground'}`}>
+                <Icon className="w-6 h-6" />
+            </div>
+            <div className="flex-1">
+                <h3 className={`font-bold ${isActive ? 'text-blue-700' : isDone ? 'text-green-700' : ''}`}>{title}</h3>
+                <p className="text-sm text-muted-foreground">{desc}</p>
+            </div>
+            {isActive && <span className="text-xs font-bold bg-blue-100 text-blue-700 px-2 py-1 rounded-full animate-pulse">WORKING</span>}
+            {isDone && <span className="text-xs font-bold bg-green-100 text-green-700 px-2 py-1 rounded-full">DONE</span>}
+        </div>
+    )
 }
